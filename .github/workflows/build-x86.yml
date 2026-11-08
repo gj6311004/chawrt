@@ -1,12 +1,12 @@
-# chawrt x86 构建 v5 —— 官方 main + x86.config，并修补 swanmon 的 glib2 拆包依赖
+# chawrt x86 构建 v6 —— 官方 main + x86.config + swanmon 依赖补丁 + 下载限时
 #
 # 失败史：
 #   v1/v2  25.12 自拼配置 → aw-bpf 源码仓库 404
-#   v3     main + x86.config，swap 步骤撞 runner 预置 /swapfile（Text file busy）
-#   v4     main + x86.config，跑到 113 分钟，swanmon 打包失败：
-#            Package swanmon is missing dependencies for the following libraries: libglib-2.0.so.0
-#          原因：chawrt 把 glib2 拆成 glib2-core/-gio/-gobject/... ，swanmon 只写了 +glib2，
-#          打包检查找不到 libglib-2.0.so.0 的提供者。补 +glib2-core 即可。
+#   v3     swap 步骤撞 runner 预置 /swapfile（Text file busy）
+#   v4     跑到 113 分钟，swanmon 缺 libglib-2.0.so.0 提供者
+#   v5     修了 swanmon（+glib2-core），但卡在"下载源码"44 分钟不动 →
+#          个别源的半开连接能一直挂着（curl 只设了 --connect-timeout，没有总时长上限）
+#   v6     download 加 timeout 限时 + 二次重试；超时不再阻塞，交给编译阶段按包补下载
 #
 name: build chawrt x86 (official)
 
@@ -73,14 +73,11 @@ jobs:
         run: |
           cd chawrt
           f=feeds/packages/utils/swanmon/Makefile
-          echo "==== 原始 DEPENDS ===="
           grep -n 'DEPENDS' "$f" || true
           sed -i 's/DEPENDS:=+davici +glib2 +libjson-c/DEPENDS:=+davici +glib2-core +glib2 +libjson-c/' "$f"
           if ! grep -q 'glib2-core' "$f"; then
-            echo "精确匹配未命中，走兜底替换"
             sed -i 's/+glib2 /+glib2-core +glib2 /' "$f"
           fi
-          echo "==== 修补后 DEPENDS ===="
           grep -n 'DEPENDS' "$f" || true
           if grep -q 'glib2-core' "$f"; then
             echo "OK: swanmon 依赖已补 glib2-core"
@@ -101,12 +98,21 @@ jobs:
           echo "==== 选中包数 ===="
           grep -c '^CONFIG_PACKAGE_.*=y$' .config || true
 
-      - name: 下载源码
+      - name: 下载源码（限时 20 分钟）
         continue-on-error: true
         run: |
           set -o pipefail
           cd chawrt
-          make download -j8 2>&1 | tee download.log | tail -n 30
+          timeout --signal=INT --kill-after=30 1200 make download -j8 2>&1 | tee download.log | tail -n 40 || true
+          echo "==== 第一次下载结束, dl 目录 ===="
+          du -sh dl 2>/dev/null || true
+          ls dl 2>/dev/null | wc -l || true
+          if [ "$(ls dl 2>/dev/null | wc -l)" -lt 50 ]; then
+            echo "dl 内容偏少，补一次单线程下载（限时 10 分钟）"
+            timeout --signal=INT --kill-after=30 600 make download -j4 2>&1 | tail -n 40 || true
+          fi
+          du -sh dl 2>/dev/null || true
+          exit 0
 
       - name: 编译
         run: |
