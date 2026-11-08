@@ -1,13 +1,15 @@
-# chawrt x86 构建 v7 —— 官方 main + x86.config + 两处上游修补
+# chawrt x86 构建 v8 —— 官方 main + x86.config + 三处上游修补
 #
-# 失败史：
-#   v1/v2  25.12 自拼配置 → aw-bpf 源码仓库 404（仓库不存在）
-#   v3     swap 步骤撞 runner 预置 /swapfile
+# 失败史（每次都在往后推进）：
+#   v1/v2  25.12 自拼配置 → aw-bpf 源码仓库 404
+#   v3     swap 撞 runner 预置 /swapfile
 #   v4     113 分钟 → swanmon 缺 libglib-2.0.so.0 提供者
-#   v5     swanmon 已修，但 download 卡 44 分钟（半开连接无总超时）
-#   v6     184 分钟 → xfrpc 的 PKG_VERSION=4.04.855 在 liudf0716/xfrpc 上不存在
-#          （实际 tag：5.09.982 / 5.06.909 / 3.05.661 …），codeload 全 404
-#   v7     修 xfrpc：版本改成真实存在的 5.09.982，预下载并重算 PKG_HASH
+#   v5     download 卡 44 分钟（无总超时）
+#   v6     184 分钟 → xfrpc PKG_VERSION=4.04.855 不存在（真实 tag 5.09.982/5.06.909/3.05.661）
+#   v7     152 分钟 → xfrpc 已编过，但打包缺 libwolfssl
+#            Package xfrpc is missing dependencies for the following libraries:
+#            libwolfssl.so.5.9.0.e624513f
+#   v8     给 xfrpc 补 +libwolfssl（xfrpc 5.x 的 CMake 默认 USE_WOLFSSL=ON）
 #
 name: build chawrt x86 (official)
 
@@ -70,22 +72,21 @@ jobs:
           ./scripts/feeds update -a
           ./scripts/feeds install -a
 
-      - name: 修补上游包源（swanmon 依赖 + xfrpc 版本）
+      - name: 修补上游包源
         run: |
           cd chawrt
 
-          echo "########## 1) swanmon: glib2 拆包依赖 ##########"
+          echo "########## 1) swanmon: 补 glib2-core ##########"
           f=feeds/packages/utils/swanmon/Makefile
-          grep -n 'DEPENDS' "$f" || true
           sed -i 's/DEPENDS:=+davici +glib2 +libjson-c/DEPENDS:=+davici +glib2-core +glib2 +libjson-c/' "$f"
           grep -q 'glib2-core' "$f" || sed -i 's/+glib2 /+glib2-core +glib2 /' "$f"
           grep -n 'DEPENDS' "$f" || true
           grep -q 'glib2-core' "$f" || { echo "::error::swanmon 补丁失败"; exit 1; }
 
-          echo "########## 2) xfrpc: 版本不存在 + hash 失配 ##########"
+          echo "########## 2) xfrpc: 版本 4.04.855 -> 5.09.982 ##########"
           x=feeds/packages/net/xfrpc/Makefile
           echo "--- 原始 ---"
-          grep -E 'PKG_VERSION|PKG_HASH|PKG_SOURCE' "$x" || true
+          grep -E 'PKG_VERSION|PKG_HASH|DEPENDS' "$x" || true
           ver=5.09.982
           sed -i "s/^PKG_VERSION:=.*/PKG_VERSION:=$ver/" "$x"
           mkdir -p dl
@@ -93,14 +94,15 @@ jobs:
             curl -fsSL --retry 3 --connect-timeout 10 --max-time 300 \
               "https://codeload.github.com/liudf0716/xfrpc/tar.gz/$ver" -o "dl/xfrpc-$ver.tar.gz" || true
           fi
-          if [ ! -s "dl/xfrpc-$ver.tar.gz" ]; then
-            echo "::error::xfrpc $ver 源码下载失败"
-            exit 1
-          fi
+          [ -s "dl/xfrpc-$ver.tar.gz" ] || { echo "::error::xfrpc $ver 下载失败"; exit 1; }
           h=$(sha256sum "dl/xfrpc-$ver.tar.gz" | awk '{print $1}')
           sed -i "s|^PKG_HASH:=.*|PKG_HASH:=$h|" "$x"
+
+          echo "########## 3) xfrpc: 补 libwolfssl 依赖 ##########"
+          sed -i 's|+libevent2-openssl|+libevent2-openssl +libwolfssl|' "$x"
           echo "--- 修补后 ---"
-          grep -E 'PKG_VERSION|PKG_HASH' "$x" || true
+          grep -E 'PKG_VERSION|PKG_HASH|DEPENDS' "$x" || true
+          grep -q 'libwolfssl' "$x" || { echo "::error::xfrpc libwolfssl 补丁失败"; exit 1; }
           ls -lh "dl/xfrpc-$ver.tar.gz"
 
       - name: 应用官方配置
@@ -110,8 +112,8 @@ jobs:
           make defconfig
           echo "==== target ===="
           grep -E '^CONFIG_TARGET_PROFILE|^CONFIG_TARGET_x86_64_DEVICE' .config || true
-          echo "==== chawrt packages ===="
-          grep -E '^CONFIG_PACKAGE_(apfree-wifidog|xfrpc|strongswan|swanmon|bpfilter|glib2)=' .config || true
+          echo "==== 关键包 ===="
+          grep -E '^CONFIG_PACKAGE_(apfree-wifidog|xfrpc|strongswan|swanmon|bpfilter|libwolfssl|glib2)=' .config || true
           echo "==== 选中包数 ===="
           grep -c '^CONFIG_PACKAGE_.*=y$' .config || true
 
@@ -124,7 +126,6 @@ jobs:
           du -sh dl 2>/dev/null || true
           ls dl 2>/dev/null | wc -l || true
           if [ "$(ls dl 2>/dev/null | wc -l)" -lt 50 ]; then
-            echo "dl 内容偏少，补一次 -j4（限时 10 分钟）"
             timeout --signal=INT --kill-after=30 600 make download -j4 2>&1 | tail -n 40 || true
           fi
           exit 0
