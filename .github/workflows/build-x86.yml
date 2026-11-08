@@ -1,29 +1,27 @@
-# chawrt x86 构建（自包含版：一个文件搞定，配置内联，不需要额外 configs/ 目录）
+# chawrt x86 构建 v3 —— 用官方 main 分支的 x86.config（官方验证过的路径）
 #
-# 用法：在 fork 仓库里新建 .github/workflows/build-x86.yml，粘贴本文件内容，Commit。
-#       然后 Actions → "build chawrt x86" → Run workflow。
+# v1/v2 在 25.12 分支自拼配置，卡在 aw-bpf 源码仓库 404（https://github.com/liudf0716/aw-bpf 不存在）。
+# v3 直接克隆上游 liudf0716/chawrt 的 main 分支，用仓库自带的 x86.config（447 个包，
+# 含 apfree-wifidog / xfrpc / strongswan / bpfilter / LuCI 全套中文），与官方
+# liudf0716/action-chawrt/build_chawrt.sh 的做法一致：
+#   git checkout main → cp x86.config .config → make oldconfig → make
 #
-# profile:
-#   base = 只保底（LuCI + dnsmasq-full + 基础网络），先确保能出镜像（约 60-120 分钟）
-#   full = 追加 chawrt 定制（wifidog / xfrpc / strongswan / 流控），时间更长
-
-name: build chawrt x86
+name: build chawrt x86 (official)
 
 on:
   workflow_dispatch:
     inputs:
-      subtarget:
-        description: 'x86 子目标'
+      ref:
+        description: '源码分支（官方默认 main）'
         required: true
-        default: '64'
-        type: choice
-        options: ['64', 'generic']
-      profile:
-        description: '配置档位'
+        default: 'main'
+        type: string
+      config:
+        description: '使用仓库内哪份 .config'
         required: true
-        default: 'base'
+        default: 'x86.config'
         type: choice
-        options: ['base', 'full']
+        options: ['x86.config', 'r2s.config', '360t7.config', 'ea0326gmp.config', 'jcg.config', 'micr6608.config']
 
 permissions:
   contents: read
@@ -34,13 +32,16 @@ jobs:
     timeout-minutes: 360
 
     steps:
-      - name: 腾磁盘
+      - name: 腾磁盘 + swap
         run: |
           df -h /
           sudo rm -rf /usr/share/dotnet /usr/share/swift /opt/ghc /usr/local/lib/android \
                       /usr/local/share/boost /opt/hostedtoolcache/CodeQL "$AGENT_TOOLSDIRECTORY" || true
           sudo apt-get clean
+          sudo fallocate -l 4G /swapfile || sudo dd if=/dev/zero of=/swapfile bs=1M count=4096
+          sudo chmod 600 /swapfile && sudo mkswap /swapfile && sudo swapon /swapfile
           df -h /
+          free -h
 
       - name: 装依赖
         run: |
@@ -49,92 +50,94 @@ jobs:
             gcc-multilib g++-multilib gettext git libncurses-dev libssl-dev \
             python3-setuptools rsync swig unzip zlib1g-dev file wget time libelf-dev
 
-      - name: 检出
-        uses: actions/checkout@v4
-        with:
-          fetch-depth: 1
+      - name: 克隆 chawrt
+        run: |
+          git clone --depth 1 -b "${{ inputs.ref }}" https://github.com/liudf0716/chawrt.git chawrt
+          cd chawrt
+          echo "HEAD: $(git log -1 --format='%h %s')"
+          ls -1 ./*.config | head -20
 
       - name: feeds
+        working-directory: chawrt
         run: |
           ./scripts/feeds update -a
           ./scripts/feeds install -a
 
-      - name: 生成配置
+      - name: 应用官方配置
+        working-directory: chawrt
         run: |
-          cat > .config <<'EOF'
-          CONFIG_TARGET_x86=y
-          CONFIG_TARGET_x86_64=y
-          CONFIG_TARGET_x86_64_Generic=y
-          CONFIG_TARGET_PER_DEVICE_ROOTFS=n
-          CONFIG_TARGET_IMAGES_GZIP=y
-          CONFIG_TARGET_ROOTFS_SQUASHFS=y
-          CONFIG_TARGET_ROOTFS_EXT4FS=y
-          CONFIG_TARGET_KERNEL_PARTSIZE=32
-          CONFIG_TARGET_ROOTFS_PARTSIZE=512
-          CONFIG_PACKAGE_luci=y
-          CONFIG_PACKAGE_luci-ssl=y
-          CONFIG_PACKAGE_dnsmasq-full=y
-          CONFIG_PACKAGE_firewall4=y
-          CONFIG_PACKAGE_nftables=y
-          CONFIG_PACKAGE_luci-i18n-base-zh-cn=y
-          CONFIG_PACKAGE_curl=y
-          CONFIG_PACKAGE_tcpdump=y
-          CONFIG_PACKAGE_htop=y
-          # CONFIG_PACKAGE_ppp is not set
-          EOF
-
-          # 32 位分支：换成 generic 子目标
-          if [ "${{ inputs.subtarget }}" = "generic" ]; then
-            sed -i 's#^CONFIG_TARGET_x86_64=y#CONFIG_TARGET_x86_generic=y#; s#^CONFIG_TARGET_x86_64_Generic=y#CONFIG_TARGET_x86_generic_Generic=y#' .config
-            sed -i '/CONFIG_TARGET_x86_64_Generic/d' .config
-          fi
-
-          # full 档位：追加 chawrt 定制包（不存在的包会被 defconfig 丢弃，不会失败）
-          if [ "${{ inputs.profile }}" = "full" ]; then
-            cat >> .config <<'EOF'
-          CONFIG_PACKAGE_apfree-wifidog=y
-          CONFIG_PACKAGE_xfrpc=y
-          CONFIG_PACKAGE_strongswan=y
-          CONFIG_PACKAGE_strongswan-swanctl=y
-          CONFIG_PACKAGE_strongswan-mod-openssl=y
-          CONFIG_PACKAGE_trafficshaper=y
-          CONFIG_PACKAGE_tc-full=y
-          CONFIG_KERNEL_BPF_SYSCALL=y
-          CONFIG_KERNEL_NET_CLS_BPF=y
-          CONFIG_KERNEL_NET_ACT_BPF=y
-          EOF
-          fi
-
+          cp "${{ inputs.config }}" .config
           make defconfig
-          echo "---- 关键项 ----"
-          grep -E '^CONFIG_TARGET_(x86|PER_DEVICE)|^CONFIG_PACKAGE_(luci|xfrpc|apfree-wifidog)=' .config || true
-          echo "---- 定制包是否可选中 ----"
-          grep -E '^CONFIG_PACKAGE_(xfrpc|apfree-wifidog|strongswan)=' .config || echo "（本轮未选中定制包）"
+          echo "==== target ===="
+          grep -E '^CONFIG_TARGET_(x86|PROFILE)|^CONFIG_TARGET_x86_64' .config || true
+          echo "==== chawrt packages ===="
+          grep -E '^CONFIG_PACKAGE_(apfree-wifidog|xfrpc|strongswan|bpfilter|luci-app-apfree-wifidog|luci-app-xfrpc)=' .config || true
+          echo "==== count ===="
+          grep -c '^CONFIG_PACKAGE_.*=y$' .config || true
 
       - name: 下载源码
-        run: |
-          make download -j8 || make download -j4 || true
-
-      - name: 编译
+        working-directory: chawrt
+        continue-on-error: true
         run: |
           set -o pipefail
-          make -j"$(nproc)" || ( echo "=== 单线程重跑定位错误 ===" && make -j1 V=s )
+          make download -j8 2>&1 | tee download.log | tail -n 30
+
+      - name: 编译
+        working-directory: chawrt
+        run: |
+          set -o pipefail
+          make -j"$(nproc)" 2>&1 | tee build.log
+
+      - name: 编译失败定位
+        if: failure()
+        working-directory: chawrt
+        run: |
+          make -j1 V=s 2>&1 | tee build-single.log | tail -n 300 || true
+
+      - name: 错误摘要
+        if: failure()
+        working-directory: chawrt
+        run: |
+          for f in build.log build-single.log download.log; do
+            [ -f "$f" ] || continue
+            echo "===== $f errors ====="
+            grep -nE 'make\[[0-9]+\]: \*\*\*|Error [0-9]+$|Killed|No space left|fatal error|ERROR:' "$f" | tail -n 50 || true
+            echo "===== $f tail 80 ====="
+            tail -n 80 "$f" || true
+          done
+          find logs -type f -name '*.txt' 2>/dev/null | head -30 || true
+          df -h /
+
+      - name: 上传诊断
+        if: failure()
+        uses: actions/upload-artifact@v5
+        with:
+          name: diag-chawrt-x86
+          path: |
+            chawrt/build.log
+            chawrt/build-single.log
+            chawrt/download.log
+            chawrt/.config
+            chawrt/logs/**
+          if-no-files-found: warn
+          retention-days: 7
 
       - name: 产物清单
+        if: success()
+        working-directory: chawrt
         run: |
-          echo "== x86/${{ inputs.subtarget}} =="
-          ls -lh bin/targets/x86/${{ inputs.subtarget}}/ || true
-          find bin/targets/x86 -maxdepth 2 -type f -name '*.img*' -printf '%10s  %p\n' || true
+          ls -lh bin/targets/x86/64/ || ls -lh bin/targets/*/*/ || true
 
-      - name: 上传
-        uses: actions/upload-artifact@v4
+      - name: 上传固件
+        if: success()
+        uses: actions/upload-artifact@v5
         with:
-          name: chawrt-x86-${{ inputs.subtarget }}-${{ inputs.profile }}
+          name: chawrt-x86-64
           path: |
-            bin/targets/x86/${{ inputs.subtarget }}/*.img.gz
-            bin/targets/x86/${{ inputs.subtarget }}/*.img
-            bin/targets/x86/${{ inputs.subtarget }}/*.tar.gz
-            bin/targets/x86/${{ inputs.subtarget }}/*.vmdk
-            bin/targets/x86/${{ inputs.subtarget }}/*.manifest
+            chawrt/bin/targets/x86/64/*.img.gz
+            chawrt/bin/targets/x86/64/*.img
+            chawrt/bin/targets/x86/64/*.tar.gz
+            chawrt/bin/targets/x86/64/*.vmdk
+            chawrt/bin/targets/x86/64/*.manifest
           if-no-files-found: error
           retention-days: 7
