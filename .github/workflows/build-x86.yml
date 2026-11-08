@@ -1,12 +1,13 @@
-# chawrt x86 构建 v6 —— 官方 main + x86.config + swanmon 依赖补丁 + 下载限时
+# chawrt x86 构建 v7 —— 官方 main + x86.config + 两处上游修补
 #
 # 失败史：
-#   v1/v2  25.12 自拼配置 → aw-bpf 源码仓库 404
-#   v3     swap 步骤撞 runner 预置 /swapfile（Text file busy）
-#   v4     跑到 113 分钟，swanmon 缺 libglib-2.0.so.0 提供者
-#   v5     修了 swanmon（+glib2-core），但卡在"下载源码"44 分钟不动 →
-#          个别源的半开连接能一直挂着（curl 只设了 --connect-timeout，没有总时长上限）
-#   v6     download 加 timeout 限时 + 二次重试；超时不再阻塞，交给编译阶段按包补下载
+#   v1/v2  25.12 自拼配置 → aw-bpf 源码仓库 404（仓库不存在）
+#   v3     swap 步骤撞 runner 预置 /swapfile
+#   v4     113 分钟 → swanmon 缺 libglib-2.0.so.0 提供者
+#   v5     swanmon 已修，但 download 卡 44 分钟（半开连接无总超时）
+#   v6     184 分钟 → xfrpc 的 PKG_VERSION=4.04.855 在 liudf0716/xfrpc 上不存在
+#          （实际 tag：5.09.982 / 5.06.909 / 3.05.661 …），codeload 全 404
+#   v7     修 xfrpc：版本改成真实存在的 5.09.982，预下载并重算 PKG_HASH
 #
 name: build chawrt x86 (official)
 
@@ -69,22 +70,38 @@ jobs:
           ./scripts/feeds update -a
           ./scripts/feeds install -a
 
-      - name: 修补 swanmon 依赖
+      - name: 修补上游包源（swanmon 依赖 + xfrpc 版本）
         run: |
           cd chawrt
+
+          echo "########## 1) swanmon: glib2 拆包依赖 ##########"
           f=feeds/packages/utils/swanmon/Makefile
           grep -n 'DEPENDS' "$f" || true
           sed -i 's/DEPENDS:=+davici +glib2 +libjson-c/DEPENDS:=+davici +glib2-core +glib2 +libjson-c/' "$f"
-          if ! grep -q 'glib2-core' "$f"; then
-            sed -i 's/+glib2 /+glib2-core +glib2 /' "$f"
-          fi
+          grep -q 'glib2-core' "$f" || sed -i 's/+glib2 /+glib2-core +glib2 /' "$f"
           grep -n 'DEPENDS' "$f" || true
-          if grep -q 'glib2-core' "$f"; then
-            echo "OK: swanmon 依赖已补 glib2-core"
-          else
-            echo "::error::swanmon 补丁失败"
+          grep -q 'glib2-core' "$f" || { echo "::error::swanmon 补丁失败"; exit 1; }
+
+          echo "########## 2) xfrpc: 版本不存在 + hash 失配 ##########"
+          x=feeds/packages/net/xfrpc/Makefile
+          echo "--- 原始 ---"
+          grep -E 'PKG_VERSION|PKG_HASH|PKG_SOURCE' "$x" || true
+          ver=5.09.982
+          sed -i "s/^PKG_VERSION:=.*/PKG_VERSION:=$ver/" "$x"
+          mkdir -p dl
+          if [ ! -s "dl/xfrpc-$ver.tar.gz" ]; then
+            curl -fsSL --retry 3 --connect-timeout 10 --max-time 300 \
+              "https://codeload.github.com/liudf0716/xfrpc/tar.gz/$ver" -o "dl/xfrpc-$ver.tar.gz" || true
+          fi
+          if [ ! -s "dl/xfrpc-$ver.tar.gz" ]; then
+            echo "::error::xfrpc $ver 源码下载失败"
             exit 1
           fi
+          h=$(sha256sum "dl/xfrpc-$ver.tar.gz" | awk '{print $1}')
+          sed -i "s|^PKG_HASH:=.*|PKG_HASH:=$h|" "$x"
+          echo "--- 修补后 ---"
+          grep -E 'PKG_VERSION|PKG_HASH' "$x" || true
+          ls -lh "dl/xfrpc-$ver.tar.gz"
 
       - name: 应用官方配置
         run: |
@@ -98,20 +115,18 @@ jobs:
           echo "==== 选中包数 ===="
           grep -c '^CONFIG_PACKAGE_.*=y$' .config || true
 
-      - name: 下载源码（限时 20 分钟）
+      - name: 下载源码（限时 15 分钟）
         continue-on-error: true
         run: |
           set -o pipefail
           cd chawrt
-          timeout --signal=INT --kill-after=30 1200 make download -j8 2>&1 | tee download.log | tail -n 40 || true
-          echo "==== 第一次下载结束, dl 目录 ===="
+          timeout --signal=INT --kill-after=30 900 make download -j8 2>&1 | tee download.log | tail -n 40 || true
           du -sh dl 2>/dev/null || true
           ls dl 2>/dev/null | wc -l || true
           if [ "$(ls dl 2>/dev/null | wc -l)" -lt 50 ]; then
-            echo "dl 内容偏少，补一次单线程下载（限时 10 分钟）"
+            echo "dl 内容偏少，补一次 -j4（限时 10 分钟）"
             timeout --signal=INT --kill-after=30 600 make download -j4 2>&1 | tail -n 40 || true
           fi
-          du -sh dl 2>/dev/null || true
           exit 0
 
       - name: 编译
@@ -129,12 +144,12 @@ jobs:
       - name: 错误摘要
         if: failure()
         run: |
-          [ -d chawrt ] || { echo "chawrt 目录不存在（克隆失败）"; exit 0; }
+          [ -d chawrt ] || { echo "chawrt 目录不存在"; exit 0; }
           cd chawrt
           for f in build.log build-single.log download.log; do
             [ -f "$f" ] || continue
             echo "===== $f errors ====="
-            grep -nE 'make\[[0-9]+\]: \*\*\*|Error [0-9]+$|Killed|No space left|fatal error|ERROR:|missing dependencies' "$f" | tail -n 50 || true
+            grep -nE 'make\[[0-9]+\]: \*\*\*|Error [0-9]+$|Killed|No space left|fatal error|ERROR:|missing dependencies|404' "$f" | tail -n 50 || true
             echo "===== $f tail 80 ====="
             tail -n 80 "$f" || true
           done
